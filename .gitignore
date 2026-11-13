@@ -1,0 +1,6 @@
+.build/
+dist/*
+!dist/icon-1024.png
+*.xcodeproj
+.DS_Store
+/tmp/
