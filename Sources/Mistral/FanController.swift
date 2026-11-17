@@ -7,6 +7,7 @@ import Foundation
 import AppKit
 import ServiceManagement
 import SMCCore
+import os
 
 // MARK: - Датчики температуры (Apple M1/M1 Pro/M1 Max, по smctemp)
 
@@ -152,7 +153,11 @@ final class FanController: ObservableObject {
     private var prevTemp: Double?
     private var highLoadTicks = 0
     private var errorCount = 0
-    private var suspendedMode: Mode?
+    /// Режим, который нужно включить, но сейчас не получилось (хелпер не ответил).
+    /// Тик повторяет попытку, пока не включится — см. retryPending().
+    private var pendingMode: Mode?
+    private var lastControlErrorLog = Date.distantPast
+    private var lastRetryLog = Date.distantPast
     private var started = false
     /// Активный режим (авто/ручной) — частый опрос; системный — редкий
     private let tickInterval: Double = 2.0
@@ -193,10 +198,25 @@ final class FanController: ObservableObject {
 
         checkHelper()
         if helperInstalled && mode != .system && !fans.isEmpty {
-            // Возвращаем сохранённый режим (обычно .auto)
-            engageMode(mode)
+            let desired = mode
+            if engageMode(desired) {
+                setPending(nil)
+                warning = nil
+            } else {
+                setPending(desired)
+                mode = .system
+                warning = "Хелпер не ответил — повторю включение автоматически"
+            }
+            logEvent("старт: сохранённый режим \(desired.rawValue), хелпер доступен")
         } else if mode != .system {
+            // Хелпера сейчас нет (или вентиляторы не прочитались): не теряем
+            // сохранённый режим, а откладываем — включится, как только
+            // помощник ответит. В дефолтах режим не трогаем.
+            let desired = mode
+            setPending(desired)
             mode = .system
+            warning = "Помощник недоступен — «\(desired.title)» включится автоматически"
+            logEvent("старт: хелпер недоступен, режим \(desired.rawValue) отложен")
         }
 
         startTimer()
@@ -232,9 +252,13 @@ final class FanController: ObservableObject {
         d.set(loadBoostEnabled, forKey: Keys.loadBoost)
     }
 
+    private func saveProfile() {
+        UserDefaults.standard.set(profile.rawValue, forKey: Keys.profile)
+    }
+
     private func startTimer() {
         timer?.invalidate()
-        currentInterval = mode == .system ? idleTickInterval : tickInterval
+        currentInterval = (mode == .system && pendingMode == nil) ? idleTickInterval : tickInterval
         let t = Timer.scheduledTimer(withTimeInterval: currentInterval, repeats: true) { [weak self] _ in
             self?.tick()
         }
@@ -245,7 +269,7 @@ final class FanController: ObservableObject {
 
     /// Сменить интервал опроса, если режим это требует (системный — редко)
     private func adjustPollingInterval() {
-        let wanted = mode == .system ? idleTickInterval : tickInterval
+        let wanted = (mode == .system && pendingMode == nil) ? idleTickInterval : tickInterval
         guard started, wanted != currentInterval else { return }
         startTimer()
     }
@@ -298,6 +322,12 @@ final class FanController: ObservableObject {
             cpuLoad = load
         }
 
+        // Отложенный режим: хелпер не отвечал, когда его включали —
+        // пробуем снова, как только он появится
+        if let pending = pendingMode, mode == .system {
+            retryPending(pending)
+        }
+
         if mode == .auto {
             regulate()
         }
@@ -312,7 +342,7 @@ final class FanController: ObservableObject {
         } else if !PrivilegedControl.demoMode,
                   Date().timeIntervalSince(lastHelperCheck) >= helperCheckInterval {
             lastHelperCheck = Date()
-            if !control.installed { handleControlError() }
+            if !control.installed { handleControlError(nil, context: "PING") }
         }
     }
 
@@ -366,22 +396,33 @@ final class FanController: ObservableObject {
                     if lastWritten.indices.contains(idx) { lastWritten[idx] = rpm }
                     errorCount = 0
                 } catch {
-                    handleControlError()
+                    handleControlError(error, context: "SETT f\(idx)")
                     return
                 }
             }
         }
     }
 
-    private func handleControlError() {
+    private func handleControlError(_ error: Error?, context: String) {
         errorCount += 1
-        if errorCount >= 3 {
-            errorCount = 0
-            warning = "Хелпер недоступен — управление возвращено системе"
-            restoreSystemQuiet()
-            mode = .system
-            checkHelper(force: true)
+        // Неудачи записи при мёртвом хелпере идут каждый тик — логируем
+        // первую и далее не чаще раза в helperCheckInterval
+        if Date().timeIntervalSince(lastControlErrorLog) >= helperCheckInterval {
+            lastControlErrorLog = Date()
+            logEvent("ошибка управления [\(context)]: " +
+                     (error.map { String(describing: $0) } ?? "нет ответа") +
+                     " (подряд: \(errorCount))")
         }
+        guard errorCount >= 3 else { return }
+        errorCount = 0
+        warning = "Хелпер недоступен — управление возвращено системе, восстановлю автоматически"
+        if mode != .system {
+            logEvent("возврат в системный режим из \(mode.rawValue)")
+            setPending(mode)
+            mode = .system
+        }
+        restoreSystemQuiet()
+        checkHelper(force: true)
     }
 
     // MARK: Режимы
@@ -391,15 +432,25 @@ final class FanController: ObservableObject {
         case .system:
             restoreSystemQuiet()
             mode = .system
+            setPending(nil)
             warning = nil
+            saveSettings()
         case .auto, .manual:
             guard helperInstalled else {
-                warning = "Сначала установите помощник"
+                warning = "Сначала установите помощника"
                 return
             }
-            engageMode(newMode)
+            if engageMode(newMode) {
+                setPending(nil)
+                warning = nil
+            } else {
+                // хелпер не ответил: оставляем систему у руля и повторяем в тике;
+                // сохранённый режим в дефолтах не трогаем
+                setPending(newMode)
+                if mode != .system { mode = .system }
+                warning = "Хелпер не ответил — повторю включение автоматически"
+            }
         }
-        saveSettings()
     }
 
     /// Выбрать профиль и включить наш авто-режим
@@ -407,9 +458,9 @@ final class FanController: ObservableObject {
         profile = newProfile
         if mode != .auto {
             setMode(.auto)
-        } else {
-            saveSettings()
         }
+        // профиль сохраняем всегда: он применится и после отложенного включения
+        saveProfile()
         // сбрасываем плавность, чтобы новая кривая применилась сразу
         lastFrac = 0
     }
@@ -428,7 +479,7 @@ final class FanController: ObservableObject {
             try control.setMode(fan: fan, manual: false)
             errorCount = 0
         } catch {
-            handleControlError()
+            handleControlError(error, context: "MODE f\(fan)=0")
         }
         if mode == .manual, fans.allSatisfy({ fanModeByte($0.id) == 0 }) {
             mode = .system
@@ -460,9 +511,30 @@ final class FanController: ObservableObject {
         saveSettings()
     }
 
-    private func engageMode(_ newMode: Mode) {
+    /// Включить ручное управление всеми вентиляторами и войти в режим.
+    /// Возвращает false, если хелпер не смог переключить вентиляторы:
+    /// тогда режим НЕ включаем — иначе приложение будет писать цели,
+    /// которые система молча перезапишет своей кривой (та самая «жара,
+    /// а вентиляторы стоят»).
+    @discardableResult
+    private func engageMode(_ newMode: Mode) -> Bool {
+        guard !fans.isEmpty else {
+            logEvent("engageMode \(newMode.rawValue): список вентиляторов пуст")
+            return false
+        }
+        var engaged: [Int] = []
         for f in fans {
-            _ = try? control.setMode(fan: f.id, manual: true)
+            do {
+                try control.setMode(fan: f.id, manual: true)
+                engaged.append(f.id)
+            } catch {
+                logEvent("ручной режим вентилятора \(f.id) не включился: \(error)")
+                // откат, чтобы не оставлять часть вентиляторов в ручном режиме
+                for i in engaged {
+                    try? control.setMode(fan: i, manual: false)
+                }
+                return false
+            }
         }
         lastWritten = Array(repeating: -1, count: max(fans.count, 1))
         lastFrac = 0
@@ -470,14 +542,18 @@ final class FanController: ObservableObject {
         prevTemp = nil
         highLoadTicks = 0
 
+        // Сначала режим: applyManual() пишет цели только в ручном режиме,
+        // так что раньше переключения этот цикл молча ничего не записывал
+        mode = newMode
+        saveSettings()
+
         if newMode == .manual {
             for f in fans {
                 let v = manualValues[f.id] ?? f.target
-                manualValues[f.id] = v
                 applyManual(fan: f.id, rpm: v)
             }
         }
-        mode = newMode
+        return true
     }
 
     func applyManual(fan: Int, rpm: Double) {
@@ -488,7 +564,7 @@ final class FanController: ObservableObject {
             try control.setTarget(fan: fan, rpm: rpm)
             errorCount = 0
         } catch {
-            handleControlError()
+            handleControlError(error, context: "applyManual f\(fan)")
         }
     }
 
@@ -544,6 +620,7 @@ final class FanController: ObservableObject {
         helperMessage = nil
         restoreSystemQuiet()
         mode = .system
+        setPending(nil)
         saveSettings()
         PrivilegedControl.uninstall { [weak self] result in
             guard let self else { return }
@@ -604,16 +681,54 @@ final class FanController: ObservableObject {
         let nc = NSWorkspace.shared.notificationCenter
         nc.addObserver(forName: NSWorkspace.willSleepNotification, object: nil, queue: .main) { [weak self] _ in
             guard let self, self.mode != .system else { return }
-            self.suspendedMode = self.mode
+            // Запоминаем режим как отложенный: после пробуждения включим
+            // (а если включить сразу не выйдет — тик будет повторять).
+            self.setPending(self.mode)
             self.restoreSystemQuiet()
             self.mode = .system
+            self.logEvent("сон: вернул вентиляторы системе, режим \(self.pendingMode?.rawValue ?? "—") отложен")
         }
         nc.addObserver(forName: NSWorkspace.didWakeNotification, object: nil, queue: .main) { [weak self] _ in
-            guard let self, let m = self.suspendedMode else { return }
-            self.suspendedMode = nil
-            if self.helperInstalled {
-                self.engageMode(m)
+            guard let self, let m = self.pendingMode else { return }
+            if self.helperInstalled && self.engageMode(m) {
+                self.setPending(nil)
+                self.warning = nil
             }
+            // Не включился — тик повторит попытку через retryPending()
         }
     }
+
+    // MARK: Отложенный режим и журнал
+
+    /// Запомнить/снять отложенный режим. Пока он есть — тик работает чаще.
+    private func setPending(_ m: Mode?) {
+        guard pendingMode != m else { return }
+        pendingMode = m
+        if started { adjustPollingInterval() }
+    }
+
+    /// Повторить включение отложенного режима. Хелпера ждём без ограничений:
+    /// PING к отсутствующему сокету мгновенно отклоняется, попытка ничего не стоит.
+    private func retryPending(_ pending: Mode) {
+        guard helperInstalled else {
+            checkHelper(force: true)
+            return
+        }
+        if engageMode(pending) {
+            setPending(nil)
+            warning = nil
+            logEvent("режим \(pending.rawValue) включён после недоступности хелпера")
+        } else if Date().timeIntervalSince(lastRetryLog) >= helperCheckInterval {
+            lastRetryLog = Date()
+            logEvent("повторное включение \(pending.rawValue) не удалось — продолжаю попытки")
+        }
+    }
+
+    /// Диагностика в unified log: Console.app или
+    /// `log show --last 1h --predicate 'subsystem == "app.mistral.Mistral"'`.
+    private func logEvent(_ message: String) {
+        Self.eventLog.info("\(message, privacy: .public)")
+    }
+
+    private static let eventLog = Logger(subsystem: "app.mistral.Mistral", category: "fan-control")
 }
