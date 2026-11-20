@@ -100,6 +100,11 @@ func restoreSystemControl(_ reason: String) {
     logLine(reason + " — вентиляторы возвращены системе")
 }
 
+/// Ссылку на таймер надо держать глобально: DispatchSourceTimer, оставленный
+/// локальной переменной, освобождается при выходе из функции и не тикает
+/// (ловили на живой железке — watchdog молчал).
+var watchdogTimer: DispatchSourceTimer?
+
 func startWatchdog() {
     let timer = DispatchSource.makeTimerSource(queue: DispatchQueue.global(qos: .utility))
     timer.schedule(deadline: .now() + 5, repeating: 5)
@@ -112,6 +117,7 @@ func startWatchdog() {
         restoreSystemControl("клиент не отвечает дольше 20 с")
     }
     timer.resume()
+    watchdogTimer = timer
 }
 
 // MARK: - Выполнение команд
