@@ -40,6 +40,11 @@ final class PrivilegedControl {
         let fd = socket(AF_UNIX, SOCK_STREAM, 0)
         guard fd >= 0 else { return nil }
 
+        // macOS не знает MSG_NOSIGNAL: запись в закрытый сокет (хелпер умер,
+        // перезагружается при переустановке) поднимает SIGPIPE и валит процесс.
+        var nosigpipe: Int32 = 1
+        setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &nosigpipe, socklen_t(MemoryLayout<Int32>.size))
+
         var addr = sockaddr_un()
         addr.sun_family = sa_family_t(AF_UNIX)
         let path = Self.effectiveSocketPath
@@ -104,6 +109,16 @@ final class PrivilegedControl {
 
     func reset() throws {
         _ = try exec("RESET")
+    }
+
+    /// Хартбит: пока приложение живо и управляет вентиляторами, оно раз в тик
+    /// присылает BEAT. Хелпер, не видевший BEAT дольше 20 с, сам возвращает
+    /// вентиляторы системе — иначе после краша приложения они остаются
+    /// замороженными в ручном режиме. Ошибки не бросаем: живость хелпера
+    /// оценивается по ошибкам записи, а не по хартбиту.
+    func heartbeat() {
+        if Self.demoMode { return }
+        _ = socketCommand("BEAT")
     }
 
     enum InstallError: Error {

@@ -27,9 +27,12 @@ final class CPULoad {
     func current() -> Double {
         var info = host_cpu_load_info()
         var count = mach_msg_type_number_t(MemoryLayout<host_cpu_load_info>.size / MemoryLayout<integer_t>.size)
+        // mach_host_self() выдаёт send-right: не dealloc'нуть — утечка порта каждый тик
+        let host = mach_host_self()
+        defer { mach_port_deallocate(mach_task_self_, host) }
         let kr = withUnsafeMutablePointer(to: &info) {
             $0.withMemoryRebound(to: integer_t.self, capacity: Int(count)) {
-                host_statistics64(mach_host_self(), HOST_CPU_LOAD_INFO, $0, &count)
+                host_statistics64(host, HOST_CPU_LOAD_INFO, $0, &count)
             }
         }
         guard kr == KERN_SUCCESS else { return 0 }
@@ -153,9 +156,16 @@ final class FanController: ObservableObject {
     private var prevTemp: Double?
     private var highLoadTicks = 0
     private var errorCount = 0
+    /// Время последней записи цели по каждому вентилятору (для retry потерянных записей)
+    private var lastWriteAt: [Int: TimeInterval] = [:]
+    private var lastDropLog = Date.distantPast
     /// Режим, который нужно включить, но сейчас не получилось (хелпер не ответил).
     /// Тик повторяет попытку, пока не включится — см. retryPending().
     private var pendingMode: Mode?
+    /// Вентиляторы, которые мы перевели в ручной режим и за которые отвечаем.
+    /// Нужен для самолечения (SMC иногда сбрасывает F#Md) и чтобы не трогать
+    /// вентиляторы, которые пользователь вернул системе точечно.
+    private var engagedFans: Set<Int> = []
     private var lastControlErrorLog = Date.distantPast
     private var lastRetryLog = Date.distantPast
     private var started = false
@@ -332,7 +342,42 @@ final class FanController: ObservableObject {
             regulate()
         }
 
+        // Самолечение: SMC может сбросить ручной режим (сон, термическое событие,
+        // рестарт демона, собственные записи системного агента). Пока F#Md = 0,
+        // наши записи целей молча отбрасываются — снаружи это выглядит как
+        // «профиль включён, а обороты не меняются». Проверяем раз в 5 тиков.
+        if mode != .system, tickCount % 5 == 0 {
+            let dropped = fans.map(\.id).filter { engagedFans.contains($0) && fanModeByte($0) == 0 }
+            if !dropped.isEmpty {
+                logEvent("SMC сбросил ручной режим вентиляторов \(dropped) — восстанавливаю")
+                for i in dropped {
+                    do { try control.setMode(fan: i, manual: true) }
+                    catch { handleControlError(error, context: "REMD f\(i)") }
+                }
+            }
+            // Ручной режим: убеждаемся, что назначенные обороты реально применились
+            // (Tg мог быть потерян при конфликте с циклом SMC)
+            if mode == .manual {
+                let now = Date().timeIntervalSince1970
+                for f in fans where engagedFans.contains(f.id) {
+                    guard let want = manualValues[f.id], lastWritten[f.id] == want,
+                          now - (lastWriteAt[f.id] ?? 0) > 3 else { continue }
+                    if abs(f.target - want) >= 50 {
+                        logEvent("ручная цель f\(f.id) не применилась (Tg=\(Int(f.target)), ждали \(Int(want))) — повторяю")
+                        applyManual(fan: f.id, rpm: want)
+                    }
+                }
+            }
+        }
+
         appendHistory()
+
+        // Хартбит для хелпера: он возвращает вентиляторы системе, если приложение
+        // умерло и 20 с тишины (см. watchdog в mistrald). Ошибки не считаем —
+        // живость хелпера здесь оценивают ошибки записи в regulate().
+        if mode != .system, !PrivilegedControl.demoMode {
+            control.heartbeat()
+        }
 
         // Живость хелпера проверяем не чаще раза в helperCheckInterval:
         // каждый PING — это connect/disconnect по unix-сокету.
@@ -387,13 +432,36 @@ final class FanController: ObservableObject {
         frac = max(frac, lastFrac - 0.06)
         lastFrac = frac
 
-        for f in fans {
+        writeTargets { f in
             let rpm = ((f.min + frac * (f.max - f.min)) / 50).rounded(.down) * 50
+            return rpm
+        }
+    }
+
+    /// Записать цели вентиляторам. Две причины для записи:
+    /// 1) кривая ушла от последней записанной цели на >= 30 об/мин;
+    /// 2) SMC молча потерял предыдущую запись: он коммитит изменения пакетно
+    ///    своим внутренним циклом, и SETT, попавший в окно до коммита ручного
+    ///    режима, отбрасывается без ошибки. Поэтому сверяем Tg обратно:
+    ///    не совпадает с последней записью — повторяем.
+    private func writeTargets(_ rpmFor: (FanUI) -> Double) {
+        let now = Date().timeIntervalSince1970
+        for f in fans {
+            let rpm = rpmFor(f)
             let idx = f.id
-            if abs(rpm - (lastWritten.indices.contains(idx) ? lastWritten[idx] : -1)) >= 30 {
+            let last = lastWritten.indices.contains(idx) ? lastWritten[idx] : -1
+            let readback = f.target
+            let dropped = last > 0 && abs(readback - last) >= 50
+                && now - (lastWriteAt[idx] ?? 0) > 3
+            if abs(rpm - last) >= 30 || dropped {
                 do {
                     try control.setTarget(fan: idx, rpm: rpm)
                     if lastWritten.indices.contains(idx) { lastWritten[idx] = rpm }
+                    lastWriteAt[idx] = now
+                    if dropped, Date().timeIntervalSince(lastDropLog) >= helperCheckInterval {
+                        lastDropLog = Date()
+                        logEvent("SMC не применил цель f\(idx) (Tg=\(Int(readback)), ждали \(Int(last))) — повторяю запись")
+                    }
                     errorCount = 0
                 } catch {
                     handleControlError(error, context: "SETT f\(idx)")
@@ -477,12 +545,14 @@ final class FanController: ObservableObject {
     func setFanSystem(_ fan: Int) {
         do {
             try control.setMode(fan: fan, manual: false)
+            engagedFans.remove(fan)
             errorCount = 0
         } catch {
             handleControlError(error, context: "MODE f\(fan)=0")
         }
         if mode == .manual, fans.allSatisfy({ fanModeByte($0.id) == 0 }) {
             mode = .system
+            engagedFans.removeAll()
             saveSettings()
         }
     }
@@ -497,9 +567,11 @@ final class FanController: ObservableObject {
         }
     }
 
-    /// Байт режима вентилятора из SMC (0 = системный авто, 1 = ручной)
+    /// Байт режима вентилятора из SMC (0 = системный авто, 1 = ручной).
+    /// Ключ режима зависит от прошивки (F0Md / F0md) — детектим, а не хардкодим.
     func fanModeByte(_ fan: Int) -> UInt8 {
-        smc.readRawByte("F\(fan)Md") ?? 0
+        guard let key = smc.fanModeKey(fan) else { return 0 }
+        return smc.readRawByte(key) ?? 0
     }
 
     func toggleLaunchAtLogin() {
@@ -536,7 +608,9 @@ final class FanController: ObservableObject {
                 return false
             }
         }
+        engagedFans = Set(engaged)
         lastWritten = Array(repeating: -1, count: max(fans.count, 1))
+        lastWriteAt.removeAll()
         lastFrac = 0
         errorCount = 0
         prevTemp = nil
@@ -552,6 +626,26 @@ final class FanController: ObservableObject {
                 let v = manualValues[f.id] ?? f.target
                 applyManual(fan: f.id, rpm: v)
             }
+        } else {
+            // Авто: пишем цели сразу, не дожидаясь тика (до 2 с). Ручной
+            // вентилятор без записанной цели держит старые обороты — снаружи
+            // это выглядит как «режим включился, а ничего не происходит».
+            // Стартуем с текущих оборотов: без прыжка, кривую профиля
+            // подставит ближайший тик. Пишем MODE и SETT одной связкой —
+            // SMC коммитит их вместе (проверено на живой машине).
+            let now = Date().timeIntervalSince1970
+            for f in fans {
+                let start = f.target > 0 ? f.target : f.current
+                guard start > 0 else { continue }
+                do {
+                    try control.setTarget(fan: f.id, rpm: start)
+                    if lastWritten.indices.contains(f.id) { lastWritten[f.id] = start }
+                    lastWriteAt[f.id] = now
+                } catch {
+                    // не срываем включение режима: цели допишет ближайший тик
+                    logEvent("стартовая цель вентилятора \(f.id) не записалась: \(error)")
+                }
+            }
         }
         return true
     }
@@ -562,6 +656,9 @@ final class FanController: ObservableObject {
         do {
             try control.setMode(fan: fan, manual: true)
             try control.setTarget(fan: fan, rpm: rpm)
+            engagedFans.insert(fan)
+            lastWritten[fan] = rpm
+            lastWriteAt[fan] = Date().timeIntervalSince1970
             errorCount = 0
         } catch {
             handleControlError(error, context: "applyManual f\(fan)")
@@ -571,7 +668,9 @@ final class FanController: ObservableObject {
     private func restoreSystemQuiet() {
         if PrivilegedControl.demoMode { return }
         try? control.reset()
+        engagedFans.removeAll()
         lastWritten = Array(repeating: -1, count: max(fans.count, 1))
+        lastWriteAt.removeAll()
     }
 
     /// Перед выходом из приложения: вернуть вентиляторы системе

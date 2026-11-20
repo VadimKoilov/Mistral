@@ -73,6 +73,19 @@ struct FanRow: View {
         return min(1, max(0, (fan.current - fan.min) / (fan.max - fan.min)))
     }
 
+    /// Диапазон слайдера: SMC может вернуть мусор (min > max), а
+    /// `fan.min...fan.max` на таком диапазоне падает — гарантируем корректность.
+    private var sliderRange: ClosedRange<Double> {
+        let lo = min(fan.min, fan.max)
+        let hi = max(fan.max, lo + 1)
+        return lo...hi
+    }
+
+    private var manualRPM: Double {
+        let v = controller.manualValues[fan.id] ?? fan.current
+        return min(max(v, sliderRange.lowerBound), sliderRange.upperBound)
+    }
+
     var body: some View {
         VStack(spacing: 4) {
             HStack {
@@ -100,19 +113,18 @@ struct FanRow: View {
                 HStack(spacing: 8) {
                     Slider(
                         value: Binding(
-                            get: { controller.manualValues[fan.id] ?? fan.current },
+                            get: { manualRPM },
                             set: { controller.manualValues[fan.id] = $0 }
                         ),
-                        in: fan.min...fan.max
+                        in: sliderRange
                     ) { editing in
                         if !editing {
-                            controller.applyManual(fan: fan.id,
-                                                   rpm: controller.manualValues[fan.id] ?? fan.current)
+                            controller.applyManual(fan: fan.id, rpm: manualRPM)
                         }
                     }
                     .controlSize(.small)
 
-                    Text(String(format: "%.0f", controller.manualValues[fan.id] ?? fan.current))
+                    Text(String(format: "%.0f", manualRPM))
                         .font(.system(size: 11).monospacedDigit())
                         .foregroundStyle(.secondary)
                         .frame(width: 42, alignment: .trailing)
@@ -235,7 +247,8 @@ struct PanelView: View {
                 HStack(spacing: 6) {
                     ForEach(FanController.Profile.allCases) { p in
                         Button {
-                            controller.profile = p
+                            // через setProfile: сохранение в дефолты + сброс плавности
+                            controller.setProfile(p)
                         } label: {
                             Text(p.title)
                                 .font(.system(size: 10, weight: controller.profile == p ? .semibold : .regular))
@@ -353,7 +366,12 @@ final class MainWindow {
     private static var closeObserver: Any?
 
     static func show() {
-        if let window, window.isVisible {
+        // Окно живёт всё время работы приложения и переиспользуется.
+        // Раньше окно пересоздавалось после закрытия — это ловилось крашем:
+        // у программно созданного NSWindow isReleasedWhenClosed по умолчанию true,
+        // AppKit делал «лишний» release при закрытии, и статическая ссылка
+        // повисала (SIGSEGV в objc_retain при следующем show()).
+        if let window {
             window.makeKeyAndOrderFront(nil)
             NSApp.activate(ignoringOtherApps: true)
             return
@@ -362,6 +380,7 @@ final class MainWindow {
         let win = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 360, height: 620),
                            styleMask: [.titled, .closable],
                            backing: .buffered, defer: false)
+        win.isReleasedWhenClosed = false
         win.title = "Mistral"
         win.contentView = NSHostingView(rootView: PanelView().environmentObject(FanController.shared))
         win.center()
@@ -373,7 +392,8 @@ final class MainWindow {
         FanController.shared.panelVisible = true
         if closeObserver == nil {
             closeObserver = NotificationCenter.default.addObserver(
-                forName: NSWindow.willCloseNotification, object: win, queue: .main) { _ in
+                forName: NSWindow.willCloseNotification, object: nil, queue: .main) { _ in
+                // окно одно — просто снимаем флаг (не важно, чем именно оно закрылось)
                 FanController.shared.panelVisible = false
             }
         }

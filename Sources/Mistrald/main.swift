@@ -8,9 +8,15 @@
 //
 //  Протокол (строка + \n):
 //    PING            -> OK mistrald <version> <helper-uid>
-//    SETT <fan> <rpm> -> OK | ERR <text>       (записать F<fan>Tg)
-//    MODE <fan> <0|1> -> OK | ERR <text>       (0 — авто, 1 — ручной)
-//    RESET            -> OK | ERR <text>       (вернуть все вентиляторы системе)
+//    BEAT            -> OK                    (хартбит живого клиента)
+//    SETT <fan> <rpm> -> OK | ERR <text>      (записать F<fan>Tg)
+//    MODE <fan> <0|1> -> OK | ERR <text>      (0 — авто, 1 — ручной)
+//    RESET            -> OK | ERR <text>      (вернуть все вентиляторы системе)
+//
+//  Watchdog: клиент (приложение) шлёт BEAT раз в тик (2 с). Если ручной режим
+//  включён, а BEAT не приходит дольше 20 с — приложение умерло (краш, kill -9),
+//  и мы сами возвращаем вентиляторы системе: иначе они остаются замороженными
+//  на последних оборотах, и система не может ими управлять.
 //
 //  Аргумент запуска: путь к сокету (по умолчанию /var/run/mistralctl.sock).
 //
@@ -19,7 +25,7 @@ import Foundation
 import Darwin
 import SMCCore
 
-let version = "1.0"
+let version = "1.1"
 let socketPath = CommandLine.arguments.count > 1
     ? CommandLine.arguments[1]
     : "/var/run/mistralctl.sock"
@@ -30,6 +36,10 @@ signal(SIGPIPE, SIG_IGN)
 func err(_ msg: String) -> Never {
     FileHandle.standardError.write(Data(("mistrald: " + msg + "\n").utf8))
     exit(1)
+}
+
+func logLine(_ msg: String) {
+    FileHandle.standardError.write(Data(("mistrald: " + msg + "\n").utf8))
 }
 
 func allowedUid() -> uid_t? {
@@ -43,6 +53,66 @@ func allowedUid() -> uid_t? {
 }
 
 let smc = SMC.shared
+
+// MARK: - Watchdog: клиент умер — возвращаем вентиляторы системе
+
+// CLOCK_MONOTONIC не тикает во время сна: заснувший Mac не считается
+// «молчащим клиентом», и после пробуждения не будет ложного сброса.
+var watchdogLock = NSLock()
+var lastBeatNS: UInt64 = 0
+var clientEngaged = false
+
+func monotonicNS() -> UInt64 { clock_gettime_nsec_np(CLOCK_MONOTONIC) }
+
+func markBeat() {
+    watchdogLock.lock()
+    lastBeatNS = monotonicNS()
+    watchdogLock.unlock()
+}
+
+func markEngaged() {
+    watchdogLock.lock()
+    clientEngaged = true
+    lastBeatNS = monotonicNS()
+    watchdogLock.unlock()
+}
+
+func markReleased() {
+    watchdogLock.lock()
+    clientEngaged = false
+    watchdogLock.unlock()
+}
+
+let beatTimeoutNS: UInt64 = 20_000_000_000  // 20 c; приложение бьётся раз в 2 c
+
+func anyFanManual() -> Bool {
+    let count = (try? smc.fanCount()) ?? 0
+    for i in 0..<count {
+        if let key = smc.fanModeKey(i), (smc.readRawByte(key) ?? 0) != 0 { return true }
+    }
+    return false
+}
+
+func restoreSystemControl(_ reason: String) {
+    let count = (try? smc.fanCount()) ?? 0
+    guard count > 0 else { return }
+    smc.restoreSystemControl(fans: count)
+    logLine(reason + " — вентиляторы возвращены системе")
+}
+
+func startWatchdog() {
+    let timer = DispatchSource.makeTimerSource(queue: DispatchQueue.global(qos: .utility))
+    timer.schedule(deadline: .now() + 5, repeating: 5)
+    timer.setEventHandler {
+        watchdogLock.lock()
+        let stale = clientEngaged && monotonicNS() - lastBeatNS > beatTimeoutNS
+        watchdogLock.unlock()
+        guard stale, anyFanManual() else { return }
+        markReleased()
+        restoreSystemControl("клиент не отвечает дольше 20 с")
+    }
+    timer.resume()
+}
 
 // MARK: - Выполнение команд
 
@@ -59,6 +129,10 @@ func handle(_ line: String) -> String {
     switch cmd {
     case "PING":
         return "OK mistrald \(version) \(getuid())"
+
+    case "BEAT":
+        markBeat()
+        return "OK"
 
     case "SETT":
         guard parts.count == 3, let fan = Int(parts[1]), let rpm = Double(parts[2]),
@@ -77,8 +151,11 @@ func handle(_ line: String) -> String {
         do {
             if mode == 1 {
                 try smc.setFanManual(fan)
+                markEngaged()
             } else {
                 try smc.setFanAuto(fan)
+                // Ручных вентиляторов не осталось — клиент отпустил управление
+                if !anyFanManual() { markReleased() }
             }
             return "OK"
         } catch {
@@ -89,6 +166,7 @@ func handle(_ line: String) -> String {
         do {
             let count = try smc.fanCount()
             smc.restoreSystemControl(fans: count)
+            markReleased()
             return "OK"
         } catch {
             return "ERR \(error)"
@@ -164,6 +242,13 @@ do {
 } catch {
     err("smc open failed: \(error)")
 }
+// После (ре)старта демона ни один клиент управление ещё не запросил: если
+// вентиляторы остались в ручном режиме от прошлого запуска (краш приложения
+// + рестарт демона), возвращаем их системе.
+if anyFanManual() {
+    restoreSystemControl("старт демона при включённом ручном режиме")
+}
+startWatchdog()
 let fd = unixListen(socketPath)
-FileHandle.standardError.write(Data("mistrald \(version): listening on \(socketPath) (uid=\(getuid()))\n".utf8))
+logLine("\(version): listening on \(socketPath) (uid=\(getuid()))")
 serve(fd)
